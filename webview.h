@@ -179,6 +179,21 @@ WEBVIEW_API void webview_unbind(webview_t w, const char *name);
 WEBVIEW_API void webview_return(webview_t w, const char *seq, int status,
                                 const char *result);
 
+// Registers a URI scheme handler for serving content.
+// Responding to handler with webview_uri_scheme_respond() is required.
+WEBVIEW_API void
+webview_register_uri_scheme(webview_t w, const char *name,
+                            void (*fn)(void *req, const char *uri, void *arg),
+                            void *arg);
+
+// Respond to a URI scheme request with the given data and mime type.
+// If size is less than zero - data is null-terminated.
+// If status is zero - success
+// If status is not zero - fail
+WEBVIEW_API void webview_uri_scheme_respond(webview_t w, void *req, int status,
+                                            const void *data, int size,
+                                            const char *mime_type);
+
 // Get the library's version information.
 // @since 0.10
 WEBVIEW_API const webview_version_info_t *webview_version();
@@ -617,7 +632,41 @@ public:
                                    nullptr, nullptr, nullptr);
   }
 
+  using uri_scheme_handler_t = std::function<void(void *, std::string, void *)>;
+  void register_uri_scheme(const std::string &name, uri_scheme_handler_t fn,
+                           void *arg) {
+    if (uri_scheme_handlers.count(name) > 0) {
+      return;
+    }
+    auto ctx = std::make_shared<uri_scheme_handler_ctx_t>(fn, arg);
+    uri_scheme_handlers[name] = ctx;
+
+    auto wkctx = webkit_web_view_get_context(WEBKIT_WEB_VIEW(m_webview));
+    webkit_web_context_register_uri_scheme(
+        wkctx, name.c_str(), [](WebKitURISchemeRequest *request,
+                                gpointer user_data) {
+      auto ctx = static_cast<uri_scheme_handler_ctx_t *>(user_data);
+      std::string uri(webkit_uri_scheme_request_get_uri(request));
+      ctx->callback(request, uri, ctx->arg);
+    }, ctx.get(), nullptr);
+  }
+
+  void uri_scheme_respond(void *req, int status, const void *data, int size,
+                          const std::string &mime_type) {
+    auto request = static_cast<WebKitURISchemeRequest *>(req);
+    auto stream = g_memory_input_stream_new_from_data(data, size, nullptr);
+    webkit_uri_scheme_request_finish(request, stream, size, mime_type.c_str());
+    g_object_unref(stream);
+  }
+
 private:
+  struct uri_scheme_handler_ctx_t {
+    uri_scheme_handler_ctx_t(uri_scheme_handler_t callback, void *arg)
+        : callback(callback), arg(arg) {}
+    uri_scheme_handler_t callback;
+    void *arg;
+  };
+
   virtual void on_message(const std::string &msg) = 0;
 
   static char *get_string_from_js_result(WebKitJavascriptResult *r) {
@@ -639,6 +688,8 @@ private:
 
   GtkWidget *m_window;
   GtkWidget *m_webview;
+
+  std::map<std::string, std::shared_ptr<uri_scheme_handler_ctx_t>> uri_scheme_handlers;
 };
 
 } // namespace detail
@@ -2284,6 +2335,32 @@ WEBVIEW_API void webview_unbind(webview_t w, const char *name) {
 WEBVIEW_API void webview_return(webview_t w, const char *seq, int status,
                                 const char *result) {
   static_cast<webview::webview *>(w)->resolve(seq, status, result);
+}
+
+WEBVIEW_API void
+webview_register_uri_scheme(webview_t w, const char *name,
+                            void (*fn)(void *req, const char *uri,
+                                       void *arg),
+                            void *arg) {
+  static_cast<webview::webview *>(w)->register_uri_scheme(
+      name,
+      [=](void *req, const std::string &uri, void *arg) {
+        fn(req, uri.c_str(), arg);
+      },
+      arg);
+}
+
+WEBVIEW_API void
+webview_uri_scheme_respond(webview_t w, void *req, int status,
+                           const void *data, int size, const char *mime_type) {
+  if (data == nullptr) {
+    size = 0;
+  } else if (size < 0) {
+    size = std::strlen(static_cast<const char *>(data));
+  }
+  static_cast<webview::webview *>(w)->uri_scheme_respond(
+      req, status, data, size, mime_type);
+      
 }
 
 WEBVIEW_API const webview_version_info_t *webview_version() {
